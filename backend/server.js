@@ -1,12 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const { nanoid } = require('nanoid');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 
 const app = express();
 const port = 3000;
+
+// === КОНФИГУРАЦИЯ JWT (Практика 8) ===
+const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret_key_change_in_prod';
+const ACCESS_EXPIRES_IN = '15m';
 
 // === SWAGGER КОНФИГУРАЦИЯ ===
 const swaggerOptions = {
@@ -21,6 +26,20 @@ const swaggerOptions = {
       {
         url: `http://localhost:${port}`,
         description: 'Локальный сервер',
+      },
+    ],
+        components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+        },
+      },
+    },
+    security: [
+      {
+        bearerAuth: [],
       },
     ],
   },
@@ -75,6 +94,15 @@ async function verifyPassword(password, passwordHash) {
   return bcrypt.compare(password, passwordHash);
 }
 
+// Генерация access-токена (Практика 8)
+function generateAccessToken(user) {
+  return jwt.sign(
+    { sub: user.id, email: user.email },
+    ACCESS_SECRET,
+    { expiresIn: ACCESS_EXPIRES_IN }
+  );
+}
+
 function findProductOr404(id, res) {
   const product = products.find(p => p.id == id);
   if (!product) {
@@ -84,7 +112,25 @@ function findProductOr404(id, res) {
   return product;
 }
 
-// === МАРШРУТЫ АВТОРИЗАЦИИ (Практика 7) ===
+// === AUTH MIDDLEWARE (Практика 8) ===
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [scheme, token] = header.split(" ");
+
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ error: "Missing or invalid Authorization header" });
+  }
+
+  try {
+    const payload = jwt.verify(token, ACCESS_SECRET);
+    req.user = payload; // { sub, email, iat, exp }
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// === МАРШРУТЫ АВТОРИЗАЦИИ ===
 
 /**
  * @swagger
@@ -184,9 +230,9 @@ app.post("/api/auth/register", async (req, res) => {
  *             schema:
  *               type: object
  *               properties:
- *                 login:
- *                   type: boolean
- *                   example: true
+ *                 accessToken:
+ *                   type: string
+ *                   example: eyJhbGciOiJIUzI1NiIs...
  *       400:
  *         description: Отсутствуют обязательные поля
  *       401:
@@ -206,15 +252,43 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(404).json({ error: "User not found" });
   }
 
-  const isAuthenticathed = await verifyPassword(password, user.passwordHash);
-  if (isAuthenticathed) {
-    res.status(200).json({ login: true });
-  } else {
-    res.status(401).json({ error: "Not authenticated" });
+  const isValid = await verifyPassword(password, user.passwordHash);
+  if (!isValid) {
+    return res.status(401).json({ error: "Not authenticated" });
   }
+
+  // Генерация access-токена (Практика 8)
+  const accessToken = generateAccessToken(user);
+  res.json({ accessToken });
 });
 
-// === МАРШРУТЫ ТОВАРОВ ===
+/**
+ * @swagger
+ * /api/auth/me:
+ *   get:
+ *     summary: Получить текущего пользователя
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Данные текущего пользователя
+ *       401:
+ *         description: Неавторизован
+ *       404:
+ *         description: Пользователь не найден
+ */
+app.get("/api/auth/me", authMiddleware, (req, res) => {
+  const userId = req.user.sub;
+  const user = users.find(u => u.id === userId);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+  const { passwordHash, ...safeUser } = user;
+  res.json(safeUser);
+});
+
+// === МАРШРУТЫ ТОВАРОВ (с защитой) ===
 
 /**
  * @swagger
@@ -236,6 +310,8 @@ app.get('/api/products', (req, res) => {
  *   get:
  *     summary: Получить товар по ID
  *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -245,10 +321,12 @@ app.get('/api/products', (req, res) => {
  *     responses:
  *       200:
  *         description: Данные товара
+ *       401:
+ *         description: Неавторизован
  *       404:
  *         description: Товар не найден
  */
-app.get('/api/products/:id', (req, res) => {
+app.get('/api/products/:id', authMiddleware, (req, res) => {
   const id = req.params.id;
   const product = findProductOr404(id, res);
   if (!product) return;
@@ -305,6 +383,8 @@ app.post('/api/products', (req, res) => {
  *   put:
  *     summary: Обновить товар по ID
  *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -319,10 +399,12 @@ app.post('/api/products', (req, res) => {
  *     responses:
  *       200:
  *         description: Товар обновлён
+ *       401:
+ *         description: Неавторизован
  *       404:
  *         description: Товар не найден
  */
-app.put('/api/products/:id', (req, res) => {
+app.put('/api/products/:id', authMiddleware, (req, res) => {
   const id = req.params.id;
   const product = findProductOr404(id, res);
   if (!product) return;
@@ -343,6 +425,8 @@ app.put('/api/products/:id', (req, res) => {
  *   delete:
  *     summary: Удалить товар по ID
  *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -352,10 +436,12 @@ app.put('/api/products/:id', (req, res) => {
  *     responses:
  *       204:
  *         description: Товар удалён
+ *       401:
+ *         description: Неавторизован
  *       404:
  *         description: Товар не найден
  */
-app.delete('/api/products/:id', (req, res) => {
+app.delete('/api/products/:id', authMiddleware, (req, res) => {
   const id = req.params.id;
   const index = products.findIndex(p => p.id === id);
   if (index === -1) return res.status(404).json({ error: "Product not found" });
